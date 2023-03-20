@@ -1,0 +1,253 @@
+---
+title: "Estimating fitness costs of pyrethroid resistance in RLEM"
+author: "James Maino"
+date: "29/04/2020"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(lme4)
+library(broom)
+library(lmerTest)
+knitr::opts_chunk$set(echo = TRUE)
+```
+   
+Load and clean data.
+   
+```{r, echo=FALSE}
+d0 = read_csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vQmErDprvdoLAIFM9Lf9Fr7JnH3_2nOYlBmYwTwr814uPDgecxpgWnExdj4WCuCVVDd915GskIWf_NY/pub?gid=0&single=true&output=csv")
+
+d = d0 %>% 
+  mutate(trtcode = ifelse(is.na(trtcode), 1, trtcode)) %>%
+  filter(trtcode == 1) %>%
+  mutate(date = as.Date(date, '%d/%m/%Y')) %>%
+  gather(var, val, -date,	-location,	-month,	-time,	-weather,	-plot,	-trtcode,	-damage) %>%
+  separate(var, c('var', 'quadrat'), sep = '\\.q', convert = TRUE) %>%
+  filter(!is.na(quadrat)) %>%
+  filter(!is.na(val)) %>%
+  filter(var %in% c('kdr_percent', 'kdr_insects.tested')) %>% 
+  spread(var, val, convert = TRUE) %>% 
+  mutate(kdr_percent = as.numeric(kdr_percent)) %>%
+  mutate(kdr_prop = kdr_percent/100) %>%
+  mutate(alleles_screened = 2*kdr_insects.tested) %>%
+  filter(!is.na(kdr_percent)) %>%
+  mutate(month = format(date, '%B')) %>% 
+  mutate(year = format(date, '%Y')) %>% 
+  mutate(years = as.integer(year)- 2017) %>%
+  mutate(year_month = format(date, '%Y-%m')) %>% 
+  mutate(days = as.numeric(date - as.Date(ifelse(location == 'Arthur River', '2017-08-01', '2017-06-26')))) %>% 
+  mutate(days_s = (days - mean(days))/sd(days))
+ 
+head(d)
+```
+   
+Fit a logistic regression with random effects for repeated measured on plot. kdr proportion is the response variable weighted by the number of alleles screened (individual mites X2).  
+   
+Full model includes fixed effect of time and location (with interaction) and random effect of plot. 
+   
+```{r, warning=FALSE}
+
+m0.0 = glmer(kdr_prop~  (1|plot), 
+            weights = alleles_screened, data=d, family = binomial)
+m0.1 = glmer(kdr_prop~ location  + (1|plot), 
+            weights = alleles_screened, data=d, family = binomial)
+m0.2 = glmer(kdr_prop~ location + days_s  + (1|plot), 
+            weights = alleles_screened, data=d, family = binomial)
+m1 = glmer(kdr_prop~ location/days_s  + (1|plot), weights = alleles_screened, 
+          data=d, family = binomial)
+d$pred_m1 = predict(m1, type= "response") # predictions with random effects
+d$pred_fixed_m1 = predict(m1, type= "response", re.form=~0) # fixed effect only
+anova(m0.0, m0.1, m0.2, m1)
+summary(m1)
+```
+
+Comparison of AIC scores and liklihood ratio tests, suggests an effect of time and location of resistance frequencies but no interation of location and decrease in resistance through time i.e. no evidence for different fitness costs by location.   
+
+We can calculate the confidence intervals for the rate of decrease for each location (on logit scale). 
+
+```{r}
+confint(m1)
+```
+
+```{r, include=FALSE}
+# some diagnostic plots
+plot(m1, type = c("p", "smooth"))
+plot(m1, sqrt(abs(resid(.))) ~ fitted(.),
+type = c("p", "smooth"))
+lattice::qqmath(m1, id = 0.05) 
+```
+   
+Summarise results across all replicates and plot means and standard error. See supplementary plot for individual replicates and random effects. 
+   
+```{r, fig.width=6, fig.height=4}
+dsum = d %>%
+  group_by(year_month, location, trtcode) %>% 
+  summarise(
+    days = mean(days),
+    days_s = mean(days_s),
+    kdr_se = sd(kdr_percent, na.rm=T)/sqrt(n()), 
+    kdr_percent = mean(kdr_percent, na.rm=T), 
+    n = n()
+  )%>%
+  mutate(rough_date = as.Date(paste0(year_month, '-01')))
+dsum$pred_fixed_m1 =  predict(m1, type="response", re.form=~0, newdata = dsum)
+
+p2 = ggplot(dsum, aes(x=rough_date, y=kdr_percent, colour=location)) +
+  geom_point(aes()) +
+  geom_line(aes(y=100*pred_fixed_m1, group = location)) + 
+  geom_errorbar(aes(ymin=kdr_percent-kdr_se, ymax=kdr_percent+kdr_se),
+                width = 0.1) + 
+  xlab('date') + 
+  ylab('kdr percent (%)') +
+  theme_classic()
+p2
+ggsave(plot=p2, 'plots/kdr_summary.png')
+```
+   
+From here we can fit a population genetics function for expected allele frequency through time. Using this function we can estimate the parameter for relative fitness of resistance genotypes. Starting resistance frequencies for the two locations are left as model parameters due to uncertainty in measurements.   
+   
+First we need to convert sample time to generation number, assuming generation 1 was the first sample point.
+   
+```{r}
+# assume first measure was generation 1
+gens_per_year = 3  # assume 3 generations per year and linear development
+diapause_days = 181  # assume no development from Nov-April
+
+d = d %>%
+  mutate(
+    generation = 1 + 
+      round(
+        gens_per_year * (days - years*diapause_days)/
+          (365 - diapause_days)))  %>% 
+  group_by(location, plot) %>% 
+  mutate(initR = mean(kdr_prop[days <= 3], na.rm=T))
+
+```
+   
+Next we need a function that can estimate resistance frequency given the starting resistance level, number of generations, dominance of fitness costs, and fitness costs. The function is based on some [simple pop gen equations]( https://www.radford.edu/~rsheehy/Gen_flash/ABLE_Workshop/Popgen_Equations.pdf):
+   
+```{r}
+estimate_R_freq = function(w_RR, h = 0.5, generation, location, initR_A, initR_T){
+  # w_RR: relative fitness of RR genotype
+  #h: dominance
+  w_SS = 1 # relative fitness of SS genotype
+  w_RS = w_RR * h + (1 - h)*w_SS # relative fitness of RS genotype 
+    
+  n = length(generation)
+  p_out = numeric(n)
+  for(i in 1:n) {
+    p =  ifelse(location[i]=="Tintinara", initR_T, initR_A)# intial R frequency
+    current_gen = 1
+    while(current_gen < generation[i]){
+      q = 1 - p # S frequency
+      w_bar = p^2*(w_RR) + 2*p*q*(w_RS) + q^2*(w_SS) # mean fitness
+      p = p^2 * w_RR / w_bar + p * q * w_RS / w_bar # update R frequency
+      current_gen = current_gen + 1
+    }
+    p_out[i] = p
+  }
+  return(p_out)
+}
+estimate_R_freq(w_RR=0.7, h=0, generation=2,  
+                location="Tintinara", initR_A=0.9, initR_T=0.5)
+```
+   
+We can then leave fitness cost as a free parameter and estimate it from the data. I fit three models assuming fitness is recessive  (h = 0), intermediate recessive (h = 0.5), and dominant (h = 1).
+   
+```{r}
+
+m2_recessive = 
+  nls(kdr_prop~estimate_R_freq(w_RR, h=0, generation,  location, initR_A, initR_T), 
+        data=d, start=c(w_RR=0.5, initR_A=0.9, initR_T=0.5))
+m2_intermediate = 
+  nls(kdr_prop~estimate_R_freq(w_RR, h=0.5, generation,  location, initR_A, initR_T), 
+        data=d, start=c(w_RR=0.5, initR_A=0.9, initR_T=0.5))
+m2_dominant = 
+  nls(kdr_prop~estimate_R_freq(w_RR, h=1, generation,  location, initR_A, initR_T), 
+        data=d, start=c(w_RR=0.5, initR_A=0.9, initR_T=0.5))
+
+calc_r2 = function(m){
+  SS = sum((d$kdr_prop - mean(d$kdr_prop))^2)
+  SSresid = sum(residuals(m)^2)
+  r2 = 1 - SSresid/SS
+  print(sprintf("r-squarred: %1.3f", r2))
+}
+
+summary(m2_recessive); calc_r2(m2_recessive)
+summary(m2_intermediate); calc_r2(m2_intermediate)
+summary(m2_dominant); calc_r2(m2_dominant)
+```
+   
+Intermediate recessiveness marginally explains the most variance, but the models all perform similarly well. Interestingly, the estimated relative fitness of the RR genotype is fairly insensitive to dominance as shown in the above model summary outputs where relative fitness of RR varies from 0.86 to 0.89. 
+   
+We can plot the the theoretical predictions against the data (under difference fitness dominace sceience). 
+   
+```{r, fig.width=6, fig.height=4}
+d$pred_recessive = predict(m2_recessive)
+d$pred_intermediate = predict(m2_intermediate)
+d$pred_dominant = predict(m2_dominant)
+
+dsum = d %>%
+  group_by(generation, location, trtcode) %>% 
+  summarise(
+    days = mean(days),
+    days_s = mean(days_s),
+    kdr_se = sd(kdr_prop, na.rm=T)/sqrt(n()), 
+    kdr_prop = mean(kdr_prop, na.rm=T),
+    n = n()
+  ) 
+
+pred = d %>% 
+  ungroup %>%
+  dplyr::select(generation, location, pred_recessive, pred_intermediate, pred_dominant) %>% distinct() %>% 
+  gather(dominance, kdr_prop, pred_recessive, pred_intermediate, pred_dominant) %>% 
+  mutate(dominance = gsub("pred_","", dominance))
+
+
+p3 = ggplot(dsum, aes(x=generation, y=kdr_prop, colour=location)) +
+  geom_point(aes()) +
+  geom_errorbar(aes(ymin=kdr_prop-kdr_se, ymax=kdr_prop+kdr_se),
+                width = 0.1) + 
+  geom_line(data = pred, aes(y=kdr_prop, color = location, linetype = dominance)) + 
+  xlab('generation') + 
+  ylab('kdr proportion') +
+  theme_classic()
+p3
+ggsave(plot=p2, 'plots/kdr_summary.png')
+
+
+```
+
+
+```{r, include=FALSE}
+# plot residuals
+plot(m2_recessive)
+plot(m2_intermediate)
+plot(m2_dominant)
+
+```
+
+# Supplementary
+   
+We can plot kdr frequency for each replicate plot. Lines show predicted values for each plot while shapes show observed data. Size of shapes denote the number of alleles screened per sample. 
+   
+```{r, fig.width=9, fig.height=7}
+p1 = ggplot(d, 
+       aes(x=days, colour=plot)) +
+  # geom_text(aes(y=kdr_percent.mean, label = plot)) +
+  geom_line(aes(y=pred_m1)) +
+  # geom_line(aes(y=pred_fixed_m1, linetype = location), size =2, colour ='black') +
+  geom_point(aes(y=kdr_percent/100, group = plot, size = alleles_screened, shape = location), 
+             position = position_jitter(width = 10)) +
+  xlab('days from first measurement') + 
+  ylab('kdr proportion') +
+  theme_classic()
+p1
+ggsave(plot=p1, 'plots/full_model.png', height=7, width=9)
+
+```
+
+
